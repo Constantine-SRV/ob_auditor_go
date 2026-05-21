@@ -4,8 +4,8 @@
 *.dll
 *.so
 *.dylib
-obauditor
-obauditor.exe
+/obauditor
+/obauditor.exe
 
 # Test binaries
 *.test
