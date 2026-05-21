@@ -1,0 +1,33 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+obauditor
+obauditor.exe
+
+# Test binaries
+*.test
+*.out
+
+# Go module cache (no need to commit)
+vendor/
+
+# Coverage
+*.cover
+*.coverprofile
+coverage.html
+
+# IDE
+.idea/
+*.iml
+.vscode/*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config overrides — uncomment if you want to keep secrets out of git
+# config.yaml
+# config.local.yaml

@@ -1,0 +1,64 @@
+# =============================================================================
+# OceanBase Auditor - конфигурация (YAML)
+# =============================================================================
+#
+# collectorId  — уникальный идентификатор экземпляра. Пусто → hostname.
+# logLevel     — DEBUG | INFO | ERROR
+# ignoredUsers — служебные УЗ, исключаемые из аудита логинов.
+#
+# ddlDclAuditMode:
+#   0 — отключён
+#   1 — основной коллектор (собирает всегда)
+#   2 — резервный коллектор (собирает только если основной не обновлял
+#       audit_collector_state более 2 минут)
+#
+# cleanup.cleanupMinute   — минута часа (0–59) для удаления, -1 = выкл.
+# cleanup.maxDdlDclAuditRows — макс. строк (0 = без лимита)
+# cleanup.maxSessionsRows    — макс. строк (0 = без лимита)
+# cleanup.chunkSize          — размер чанка при удалении
+#
+# Под Windows пути расшаренных каталогов задаются UNC-нотацией:
+#   "\\\\192.168.55.205\\oceanbase_log"  (двойные обратные слэши в YAML)
+# или через короткую запись (стандартная YAML, одинарный слэш без экранирования):
+#   '\\192.168.55.205\oceanbase_log'      (в одинарных кавычках)
+# =============================================================================
+
+collectorId: ""
+
+logLevel: "INFO"
+
+ignoredUsers:
+  - ocp_monitor
+  - proxy_ro
+  - proxyro
+
+ddlDclAuditMode: 1
+
+cleanup:
+  cleanupMinute: 0
+  maxDdlDclAuditRows: 500000
+  maxSessionsRows: 500000
+  chunkSize: 5000
+
+obProxyLogPaths:
+  - '\\192.168.55.200\obproxy_log'
+  # - '\\192.168.55.201\obproxy_log'
+
+obServerLogPaths:
+  - '\\192.168.55.205\oceanbase_log'
+  # - '\\192.168.55.206\oceanbase_log'
+  # - '\\192.168.55.207\oceanbase_log'
+
+systemTenantConnection:
+  hosts:
+    - "192.168.55.205:2881"
+    # - "192.168.55.206:2881"
+  user: "ocp@sys"
+  password: "qaz123"
+  database: "oceanbase"
+
+rsyslog:
+  host: "192.168.55.200"
+  port: 514
+  batchSize: 500
+  facility: "user"

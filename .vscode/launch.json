@@ -1,0 +1,33 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch obauditor (config.yaml)",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/obauditor",
+      "cwd": "${workspaceFolder}",
+      "args": ["config.yaml"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Launch obauditor (custom config path)",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/obauditor",
+      "cwd": "${workspaceFolder}",
+      "args": ["${input:configPath}"],
+      "console": "integratedTerminal"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "configPath",
+      "type": "promptString",
+      "description": "Path to config.yaml",
+      "default": "config.yaml"
+    }
+  ]
+}
