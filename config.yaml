@@ -31,6 +31,7 @@ ignoredUsers:
   - ocp_monitor
   - proxy_ro
   - proxyro
+  - binlog
 
 ddlDclAuditMode: 1
 
