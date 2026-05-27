@@ -17,7 +17,7 @@ import (
 )
 
 const defaultConfig = "config.yaml"
-const version = "go-20260521-1"
+const version = "go-20260527-1"
 
 func main() {
 	totalStart := time.Now()

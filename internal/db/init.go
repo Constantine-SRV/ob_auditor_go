@@ -59,9 +59,10 @@ func (i *Initializer) Initialize() error {
 	tables := []tableDef{
 		sessionsTable(),
 		logfilesTable(),
-		auditCollectorStateTable(),
+		auditCollectorStateTable(),    // legacy v1, оставлен для backward compat
 		ddlDclAuditLogTable(),
 		ddlDclAuditTargetsTable(),
+		ddlDclAuditCheckpointTable(),  // v2 per-server-tenant курсор
 		rsyslogCursorTable(),
 	}
 	for _, t := range tables {
@@ -70,7 +71,7 @@ func (i *Initializer) Initialize() error {
 		}
 	}
 
-	// audit_collector_state имеет ровно одну строку id=1
+	// audit_collector_state имеет ровно одну строку id=1 (legacy v1)
 	if err := i.ensureAuditCollectorStateRow(db); err != nil {
 		return err
 	}
@@ -195,15 +196,18 @@ func logfilesTable() tableDef {
 	return tableDef{"logfiles", ddl}
 }
 
+// auditCollectorStateTable — legacy v1, оставлена для backward compat.
+// v2 использует ddl_dcl_audit_checkpoint вместо неё, но таблицу создаём
+// (на случай отката или параллельного запуска SP-варианта).
 func auditCollectorStateTable() tableDef {
 	ddl := strings.Join([]string{
 		"CREATE TABLE `audit_collector_state` (",
 		"  `id`                BIGINT       NOT NULL,",
 		"  `collector_id`      VARCHAR(64)  NOT NULL COMMENT 'Идентификатор коллектора',",
-		"  `last_request_time` BIGINT       NOT NULL DEFAULT 0 COMMENT 'request_time последней обработанной записи GV$OB_SQL_AUDIT',",
+		"  `last_request_time` BIGINT       NOT NULL DEFAULT 0 COMMENT 'request_time последней обработанной записи (legacy v1)',",
 		"  `updated_at`        DATETIME(6)      NULL COMMENT 'Wall-clock время последнего успешного сбора',",
 		"  PRIMARY KEY (`id`)",
-		") COMMENT = 'Состояние DDL/DCL коллектора'",
+		") COMMENT = 'Legacy v1 состояние DDL/DCL коллектора (не используется в v2)'",
 	}, "\n")
 	return tableDef{"audit_collector_state", ddl}
 }
@@ -257,6 +261,30 @@ func ddlDclAuditTargetsTable() tableDef {
 		") COMMENT = 'Объекты для дополнительного DML-аудита через GV$OB_SQL_AUDIT'",
 	}, "\n")
 	return tableDef{"ddl_dcl_audit_targets", ddl}
+}
+
+// ddlDclAuditCheckpointTable — v2 per-server-tenant курсор.
+//
+// Одна строка на каждую комбинацию (svr_ip, svr_port, tenant_id) из
+// DBA_OB_UNITS. Заполняется и обновляется автоматически в DdlDclAuditDao.
+//
+// last_end_time — это request_time + elapsed_time (момент попадания записи
+// в audit-буфер) последней обработанной строки. Использование «end»-времени
+// вместо «start» решает проблему long-running DDL: запрос, стартовавший
+// до курсора но завершившийся после, при start-курсоре терялся; при
+// end-курсоре он гарантированно попадёт в следующее окно.
+func ddlDclAuditCheckpointTable() tableDef {
+	ddl := strings.Join([]string{
+		"CREATE TABLE `ddl_dcl_audit_checkpoint` (",
+		"  `svr_ip`        VARCHAR(46) NOT NULL COMMENT 'IP OBServer-узла',",
+		"  `svr_port`      BIGINT      NOT NULL COMMENT 'RPC порт (обычно 2882)',",
+		"  `tenant_id`     BIGINT      NOT NULL COMMENT 'ID тенанта',",
+		"  `last_end_time` BIGINT      NOT NULL DEFAULT 0 COMMENT 'request_time + elapsed_time последней обработанной записи, мкс от epoch',",
+		"  `updated_at`    DATETIME(6)     NULL COMMENT 'Wall-clock последнего прогона коллектора по этому юниту',",
+		"  PRIMARY KEY (`svr_ip`, `svr_port`, `tenant_id`)",
+		") COMMENT = 'Per server-tenant курсор DDL/DCL аудита (v2)'",
+	}, "\n")
+	return tableDef{"ddl_dcl_audit_checkpoint", ddl}
 }
 
 func rsyslogCursorTable() tableDef {
