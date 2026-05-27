@@ -1,41 +1,23 @@
 -- =============================================================================
 --  admintools.sp_collect_ddl_dcl_audit_v2
 --
---  Новая версия с per-server-tenant курсором по (request_time + elapsed_time).
+--  Отладочная процедура DDL/DCL аудита с per-server-tenant курсором
+--  по (request_time + elapsed_time).
 --
---  Ключевые отличия от v1:
---    - чекпойнт хранится per (svr_ip, svr_port, tenant_id), не один на всё
---    - курсор продвигается по MAX(request_time + elapsed_time) — то есть по
---      моменту ПОЯВЛЕНИЯ записи в GV$OB_SQL_AUDIT, не по моменту старта
---      запроса. Это даёт корректную обработку длительных запросов: пока
---      запрос не завершился, его в audit-буфере НЕТ; когда завершится —
---      запишется с end_calc > всех предыдущих end_calc, попадёт в окно.
---    - safety_lag не нужен: in-flight запросы по определению не в буфере
---    - wraparound request_id не страшен: используем wall-clock мкс, монотонные
---      независимо от рестартов observer-а
---    - sync списка юнитов из DBA_OB_UNITS перед каждым прогоном:
---        * новые юниты подхватываются автоматически (INSERT IGNORE)
---        * пропавшие юниты ("ghosts") обрабатываются последний раз,
---          забирают остатки из буфера, потом удаляются из checkpoint
+--  Вызов без параметров:
+--    CALL admintools.sp_collect_ddl_dcl_audit_v2();
 --
---  Старая sp_collect_ddl_dcl_audit + audit_collector_state не трогаются.
---  Обе могут работать параллельно — UNIQUE KEY (svr_ip, request_id) в
---  ddl_dcl_audit_log предотвращает дубликаты.
+--  Возвращает два result set:
+--    1. агрегаты прогона (одна строка):
+--       inserted, rows_scanned, units_total, units_new,
+--       units_with_data, units_ghost, duration_ms
+--    2. per-unit детализация из ddl_dcl_audit_last_run_stats:
+--       seq, svr_ip, svr_port, tenant_id, status,
+--       last_end_before_ts, last_end_after_ts,
+--       rows_scanned, rows_inserted, duration_ms
 --
---  Способы вызова:
---    A. Через обёртку (без параметров, удобно для ручного вызова):
---         CALL admintools.sp_collect_ddl_dcl_audit_v2_run();
---       → автоматически выведет два result set'а:
---         (1) агрегаты прогона
---         (2) per-unit детализация
---
---    B. Через основную процедуру (для Go-приложения, с OUT-параметрами):
---         CALL admintools.sp_collect_ddl_dcl_audit_v2(
---             @inserted, @rows_scanned, @units_total, @units_new,
---             @units_with_data, @units_ghost, @duration_ms);
---         SELECT @inserted, @rows_scanned, @units_total, @units_new,
---                @units_with_data, @units_ghost, @duration_ms;
---         SELECT * FROM admintools.ddl_dcl_audit_last_run_stats;
+--  Production-версия будет реализована в Go, эта процедура — только для
+--  ручной отладки и валидации логики.
 --
 --  Установка (важно: collation_connection сессии должен быть utf8mb4_general_ci):
 --    obclient -h <host> -P 2881 -u root@sys -p admintools < ddldclaudit_v2.sql
@@ -44,7 +26,7 @@
 -- =============================================================================
 
 
--- ─── 0. DDL новых таблиц ─────────────────────────────────────────────────
+-- ─── 0. DDL новых таблиц (CREATE IF NOT EXISTS — идемпотентно) ───────────
 
 CREATE TABLE IF NOT EXISTS admintools.ddl_dcl_audit_checkpoint (
     svr_ip         VARCHAR(46) NOT NULL COMMENT 'IP OBServer-узла',
@@ -84,23 +66,15 @@ CREATE TABLE IF NOT EXISTS admintools.ddl_dcl_audit_last_run_stats (
 ) COMMENT='Детализация последнего прогона sp_collect_ddl_dcl_audit_v2 (обнуляется при каждом CALL)';
 
 
--- ─── 1. Основная процедура (с OUT-параметрами, для Go-приложения) ────────
+-- ─── 1. Отладочная процедура ─────────────────────────────────────────────
 
 DELIMITER $$
 
 DROP PROCEDURE IF EXISTS admintools.sp_collect_ddl_dcl_audit_v2 $$
 
-CREATE PROCEDURE admintools.sp_collect_ddl_dcl_audit_v2(
-    OUT p_inserted          BIGINT,
-    OUT p_rows_scanned      BIGINT,
-    OUT p_units_total       BIGINT,
-    OUT p_units_new         BIGINT,
-    OUT p_units_with_data   BIGINT,
-    OUT p_units_ghost       BIGINT,
-    OUT p_duration_ms       BIGINT
-)
+CREATE PROCEDURE admintools.sp_collect_ddl_dcl_audit_v2()
     SQL SECURITY INVOKER
-    COMMENT 'DDL/DCL аудит v2: per-server-tenant курсор + расширенная диагностика'
+    COMMENT 'Отладочная DDL/DCL аудит-процедура v2: per-server-tenant курсор + вывод двух result set'
 BEGIN
     -- ─── локальные переменные ───────────────────────────────────────────
     DECLARE v_done                TINYINT  DEFAULT 0;
@@ -372,59 +346,16 @@ BEGIN
     DELETE FROM admintools.ddl_dcl_audit_ghost_buffer WHERE 1=1;
 
 
-    -- ═══ возврат метрик ══════════════════════════════════════════════════
-    SET p_inserted        = v_inserted_total;
-    SET p_rows_scanned    = v_rows_scanned_total;
-    SET p_units_total     = v_units_total;
-    SET p_units_new       = v_units_new;
-    SET p_units_with_data = v_units_with_data;
-    SET p_units_ghost     = v_units_ghost;
-    SET p_duration_ms     = (time_to_usec(NOW(6)) - v_started_at_usec) DIV 1000;
-END $$
+    -- ═══ Шаг 7: result set 1 — агрегаты ══════════════════════════════════
+    SELECT v_inserted_total      AS inserted,
+           v_rows_scanned_total  AS rows_scanned,
+           v_units_total         AS units_total,
+           v_units_new           AS units_new,
+           v_units_with_data     AS units_with_data,
+           v_units_ghost         AS units_ghost,
+           (time_to_usec(NOW(6)) - v_started_at_usec) DIV 1000 AS duration_ms;
 
-
--- =============================================================================
---  admintools.sp_collect_ddl_dcl_audit_v2_run
---
---  Обёртка без параметров для удобного ручного вызова.
---  Внутри вызывает sp_collect_ddl_dcl_audit_v2 и автоматически выводит
---  два result set'а:
---    1. агрегаты прогона (одна строка)
---    2. per-unit детализация из ddl_dcl_audit_last_run_stats
---
---  Использование:
---    CALL admintools.sp_collect_ddl_dcl_audit_v2_run();
--- =============================================================================
-
-DROP PROCEDURE IF EXISTS admintools.sp_collect_ddl_dcl_audit_v2_run $$
-
-CREATE PROCEDURE admintools.sp_collect_ddl_dcl_audit_v2_run()
-    SQL SECURITY INVOKER
-    COMMENT 'Обёртка для ручного вызова sp_collect_ddl_dcl_audit_v2 с выводом метрик'
-BEGIN
-    DECLARE v_inserted        BIGINT;
-    DECLARE v_rows_scanned    BIGINT;
-    DECLARE v_units_total     BIGINT;
-    DECLARE v_units_new       BIGINT;
-    DECLARE v_units_with_data BIGINT;
-    DECLARE v_units_ghost     BIGINT;
-    DECLARE v_duration_ms     BIGINT;
-
-    -- сам прогон
-    CALL admintools.sp_collect_ddl_dcl_audit_v2(
-        v_inserted, v_rows_scanned, v_units_total, v_units_new,
-        v_units_with_data, v_units_ghost, v_duration_ms);
-
-    -- result set 1: агрегаты
-    SELECT v_inserted        AS inserted,
-           v_rows_scanned    AS rows_scanned,
-           v_units_total     AS units_total,
-           v_units_new       AS units_new,
-           v_units_with_data AS units_with_data,
-           v_units_ghost     AS units_ghost,
-           v_duration_ms     AS duration_ms;
-
-    -- result set 2: per-unit детализация
+    -- ═══ Шаг 8: result set 2 — per-unit детализация ══════════════════════
     SELECT seq,
            svr_ip, svr_port, tenant_id, status,
            usec_to_time(last_end_before) AS last_end_before_ts,
@@ -436,95 +367,6 @@ BEGIN
      ORDER BY seq;
 END $$
 
-
--- =============================================================================
---  admintools.sp_collect_ddl_dcl_audit_v2_preview
---
---  Версия для отладки. НЕ выполняет INSERT и НЕ обновляет checkpoint.
---  Возвращает 2 result set:
---    1. список юнитов которые будут обработаны (с пометкой ghost/live/new)
---    2. сгенерированный текст INSERT (схематично, с плейсхолдерами)
--- =============================================================================
-DROP PROCEDURE IF EXISTS admintools.sp_collect_ddl_dcl_audit_v2_preview $$
-
-CREATE PROCEDURE admintools.sp_collect_ddl_dcl_audit_v2_preview()
-    SQL SECURITY INVOKER
-    COMMENT 'Preview для sp_collect_ddl_dcl_audit_v2 без побочных эффектов'
-BEGIN
-    DECLARE v_done           TINYINT DEFAULT 0;
-    DECLARE v_dyn_targets    LONGTEXT DEFAULT '';
-    DECLARE v_tgt_tenant_id  BIGINT;
-    DECLARE v_tgt_db_name    VARCHAR(128);
-    DECLARE v_tgt_obj_name   VARCHAR(128);
-    DECLARE v_db_esc         VARCHAR(256);
-    DECLARE v_obj_esc        VARCHAR(256);
-
-    DECLARE cur_targets CURSOR FOR
-        SELECT tenant_id, db_name, object_name
-          FROM admintools.ddl_dcl_audit_targets
-         WHERE is_active = 1
-         ORDER BY id;
-
-    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
-
-    OPEN cur_targets;
-    target_loop: LOOP
-        FETCH cur_targets INTO v_tgt_tenant_id, v_tgt_db_name, v_tgt_obj_name;
-        IF v_done = 1 THEN LEAVE target_loop; END IF;
-        SET v_obj_esc = REPLACE(v_tgt_obj_name, '''', '''''');
-        IF v_tgt_db_name IS NOT NULL AND v_tgt_db_name <> '' THEN
-            SET v_db_esc = REPLACE(v_tgt_db_name, '''', '''''');
-            SET v_dyn_targets = CONCAT(v_dyn_targets,
-                '     OR (query_sql LIKE ''%', v_db_esc, '.', v_obj_esc, '%''',
-                ' OR (db_name = ''', v_db_esc, ''' AND query_sql LIKE ''%', v_obj_esc, '%''))'
-            );
-        ELSE
-            SET v_dyn_targets = CONCAT(v_dyn_targets,
-                '     OR query_sql LIKE ''%', v_obj_esc, '%'''
-            );
-        END IF;
-    END LOOP target_loop;
-    CLOSE cur_targets;
-
-    -- 1) список юнитов которые будут обработаны
-    SELECT 'EXISTING' AS source_in_run,
-           c.svr_ip, c.svr_port, c.tenant_id,
-           c.last_end_time,
-           usec_to_time(c.last_end_time) AS last_end_ts,
-           c.updated_at,
-           CASE WHEN u.tenant_id IS NULL THEN 'GHOST' ELSE 'LIVE' END AS status
-      FROM admintools.ddl_dcl_audit_checkpoint c
-      LEFT JOIN oceanbase.DBA_OB_UNITS u
-        ON u.svr_ip = c.svr_ip AND u.svr_port = c.svr_port
-       AND u.tenant_id = c.tenant_id AND u.status = 'ACTIVE'
-    UNION ALL
-    SELECT 'NEW (will be added)' AS source_in_run,
-           u.svr_ip, u.svr_port, u.tenant_id,
-           0 AS last_end_time,
-           usec_to_time(0) AS last_end_ts,
-           NULL AS updated_at,
-           'LIVE' AS status
-      FROM oceanbase.DBA_OB_UNITS u
-      LEFT JOIN admintools.ddl_dcl_audit_checkpoint c
-        ON c.svr_ip = u.svr_ip AND c.svr_port = u.svr_port
-       AND c.tenant_id = u.tenant_id
-     WHERE u.status = 'ACTIVE' AND c.tenant_id IS NULL
-    ORDER BY svr_ip, svr_port, tenant_id;
-
-    -- 2) сгенерированный INSERT (схематично)
-    SET @ins_sql = CONCAT(
-        'INSERT IGNORE INTO admintools.ddl_dcl_audit_log (...)\n',
-        'SELECT ... FROM oceanbase.GV$OB_SQL_AUDIT\n',
-        ' WHERE svr_ip = ? AND svr_port = ? AND tenant_id = ?\n',
-        '   AND is_inner_sql = 0\n',
-        '   AND request_time + elapsed_time >  ? (= v_last_end)\n',
-        '   AND request_time + elapsed_time <= ? (= v_new_end)\n',
-        '   AND <DDL/DCL filters>',
-        v_dyn_targets
-    );
-    SELECT @ins_sql AS generated_sql_skeleton;
-END $$
-
 DELIMITER ;
 
 
@@ -532,21 +374,10 @@ DELIMITER ;
 --  Примеры использования
 -- =============================================================================
 --
--- 1) Удобный ручной запуск (без параметров, два result set'а на выходе):
---    CALL admintools.sp_collect_ddl_dcl_audit_v2_run();
+-- 1) Боевой запуск (получаем два result set):
+--    CALL admintools.sp_collect_ddl_dcl_audit_v2();
 --
--- 2) Программный запуск (для Go-приложения, с OUT-параметрами):
---    CALL admintools.sp_collect_ddl_dcl_audit_v2(
---        @inserted, @rows_scanned, @units_total, @units_new,
---        @units_with_data, @units_ghost, @duration_ms);
---    SELECT @inserted, @rows_scanned, @units_total, @units_new,
---           @units_with_data, @units_ghost, @duration_ms;
---    SELECT * FROM admintools.ddl_dcl_audit_last_run_stats;
---
--- 3) Preview без побочных эффектов:
---    CALL admintools.sp_collect_ddl_dcl_audit_v2_preview();
---
--- 4) Текущее состояние всех курсоров:
+-- 2) Текущее состояние всех курсоров:
 --    SELECT svr_ip, svr_port, tenant_id,
 --           last_end_time,
 --           usec_to_time(last_end_time) AS last_end_ts,
@@ -555,7 +386,7 @@ DELIMITER ;
 --      FROM admintools.ddl_dcl_audit_checkpoint
 --     ORDER BY svr_ip, svr_port, tenant_id;
 --
--- 5) Сравнение checkpoint с DBA_OB_UNITS (увидеть ghosts и пропущенные новые):
+-- 3) Сравнение checkpoint с DBA_OB_UNITS (увидеть ghosts и пропущенные новые):
 --    SELECT 'in_checkpoint_but_not_in_units' AS issue,
 --           c.svr_ip, c.svr_port, c.tenant_id
 --      FROM admintools.ddl_dcl_audit_checkpoint c
@@ -572,19 +403,15 @@ DELIMITER ;
 --       AND c.tenant_id=u.tenant_id
 --     WHERE u.status='ACTIVE' AND c.tenant_id IS NULL;
 --
--- 6) Сброс всех курсоров (повторно обработать буфер):
+-- 4) Сброс всех курсоров (повторно обработать буфер):
 --    UPDATE admintools.ddl_dcl_audit_checkpoint SET last_end_time = 0;
 --
--- 7) Полная чистка состояния v2 (начать с нуля):
+-- 5) Полная чистка состояния v2 (начать с нуля):
 --    DELETE FROM admintools.ddl_dcl_audit_checkpoint     WHERE 1=1;
 --    DELETE FROM admintools.ddl_dcl_audit_ghost_buffer   WHERE 1=1;
 --    DELETE FROM admintools.ddl_dcl_audit_last_run_stats WHERE 1=1;
 --
--- 8) Регулярный запуск через cron (раз в минуту, человеко-читаемый вывод):
---    obclient -h 192.168.55.205 -P 2881 -u ocp@sys -pqaz123 admintools \
---      -e "CALL admintools.sp_collect_ddl_dcl_audit_v2_run();"
---
--- 9) Что попало в лог за последние 10 минут:
+-- 6) Что попало в лог за последние 10 минут:
 --    SELECT collected_at, request_ts, tenant_name, user_name, stmt_type,
 --           LEFT(query_sql, 100) AS query_preview
 --      FROM admintools.ddl_dcl_audit_log
