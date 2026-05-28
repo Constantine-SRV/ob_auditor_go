@@ -49,7 +49,7 @@ import (
 )
 
 const defaultConfig = "config.yaml"
-const version = "go-20260528-daemon"
+const version = "go-20260528-2"
 
 func main() {
 	configPath := defaultConfig
@@ -104,10 +104,12 @@ func main() {
 		syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// 6. Heartbeat-ы и watchdog
+	// 6. Heartbeat-ы, статистика и watchdog
 	hbLogs := daemon.NewHeartbeat("logs")
 	hbDdl := daemon.NewHeartbeat("ddl")
 	hbRsyslog := daemon.NewHeartbeat("rsyslog")
+
+	stats := daemon.NewStats()
 
 	wd := daemon.NewWatchdog(
 		cfg.Daemon.WatchdogThreshold,
@@ -125,14 +127,14 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runLogsLoop(ctx, conn, cfg, log, hbLogs)
+		runLogsLoop(ctx, conn, cfg, log, hbLogs, stats)
 	}()
 
 	if cfg.DdlDclAuditMode > 0 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runDdlLoop(ctx, conn, cfg, log, hbDdl)
+			runDdlLoop(ctx, conn, cfg, log, hbDdl, stats)
 		}()
 	} else {
 		log.Infof("[Main] DdlDclAuditMode=0, ddl loop disabled")
@@ -142,7 +144,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runRsyslogLoop(ctx, conn, cfg, log, hbRsyslog)
+			runRsyslogLoop(ctx, conn, cfg, log, hbRsyslog, stats)
 		}()
 	} else {
 		log.Infof("[Main] rsyslog.host empty, rsyslog loop disabled")
@@ -151,6 +153,12 @@ func main() {
 	// Watchdog в отдельной горутине, она НЕ участвует в wg.Wait —
 	// она сама дёргает os.Exit при срабатывании и не должна задерживать shutdown.
 	go wd.Run(ctx)
+
+	// Горутина сводной статистики [stats] раз в StatsInterval.
+	// Тоже вне wg.Wait — она не выполняет полезной работы, только печатает.
+	if cfg.Daemon.StatsInterval > 0 {
+		go stats.PrintLoop(ctx, cfg.Daemon.StatsInterval, log)
+	}
 
 	log.Infof("[Main] All loops started, waiting for signal")
 
@@ -172,7 +180,7 @@ func main() {
 // ─────────────────────────────────────────────────────────────────────
 
 func runLogsLoop(ctx context.Context, conn *sql.DB, cfg *config.AppConfig,
-	log *logging.Logger, hb *daemon.Heartbeat) {
+	log *logging.Logger, hb *daemon.Heartbeat, stats *daemon.Stats) {
 
 	sessionDao := db.NewSessionDao(conn)
 	cleanupDao := db.NewCleanupDao(conn, log, cfg.Cleanup.ChunkSize)
@@ -207,18 +215,20 @@ func runLogsLoop(ctx context.Context, conn *sql.DB, cfg *config.AppConfig,
 				cleanedSessions = n
 			}
 
-			elapsedMs := time.Since(t0).Milliseconds()
 			lines := processor.TotalLines()
 			inserted := processor.TotalInserted()
 			logoff := processor.TotalLogoff()
 			logoffMiss := processor.TotalLogoffMiss()
 
-			// Лог только при ненулевой активности (или DEBUG).
-			if log.IsDebug() ||
-				inserted > 0 || logoff > 0 || logoffMiss > 0 || cleanedSessions > 0 {
-				log.Infof("[logs] cycle=%d time=%dms lines=%d inserted=%d logoff=%d logoffMiss=%d cleanedSessions=%d",
-					cycleCount, elapsedMs, lines, inserted, logoff, logoffMiss, cleanedSessions)
-			}
+			// Копим в сводную статистику ([stats]).
+			stats.AddFiles(lines, inserted, logoff, logoffMiss, cleanedSessions)
+
+			// Пер-цикловая строка — только в DEBUG. В INFO остаются
+			// только пер-файловые "done" и "Rotation detected" из
+			// самого LogFileProcessor.
+			log.Debugf("[logs] cycle=%d time=%dms lines=%d inserted=%d logoff=%d logoffMiss=%d cleanedSessions=%d",
+				cycleCount, time.Since(t0).Milliseconds(),
+				lines, inserted, logoff, logoffMiss, cleanedSessions)
 			return nil
 		})
 }
@@ -228,7 +238,7 @@ func runLogsLoop(ctx context.Context, conn *sql.DB, cfg *config.AppConfig,
 // ─────────────────────────────────────────────────────────────────────
 
 func runDdlLoop(ctx context.Context, conn *sql.DB, cfg *config.AppConfig,
-	log *logging.Logger, hb *daemon.Heartbeat) {
+	log *logging.Logger, hb *daemon.Heartbeat, stats *daemon.Stats) {
 
 	auditDao := db.NewDdlDclAuditDao(conn, log)
 	cleanupDao := db.NewCleanupDao(conn, log, cfg.Cleanup.ChunkSize)
@@ -263,9 +273,7 @@ func runDdlLoop(ctx context.Context, conn *sql.DB, cfg *config.AppConfig,
 				inserted = n
 			}
 
-			// Cleanup каждые N циклов (даже на резерве — проверка дешёвая,
-			// плюс на резерве у тебя обычно maxDdlDclAuditRows больше, и
-			// до cleanup-а просто никогда не доходит, что и нужно).
+			// Cleanup каждые N циклов.
 			var cleanedDdl int64
 			if cfg.Cleanup.Enabled &&
 				cfg.Daemon.CleanupEveryNCycles > 0 &&
@@ -277,11 +285,11 @@ func runDdlLoop(ctx context.Context, conn *sql.DB, cfg *config.AppConfig,
 				cleanedDdl = n
 			}
 
-			elapsedMs := time.Since(t0).Milliseconds()
-			if log.IsDebug() || inserted > 0 || cleanedDdl > 0 {
-				log.Infof("[ddl] cycle=%d time=%dms collect=%v inserted=%d cleanedDdl=%d",
-					cycleCount, elapsedMs, doCollect, inserted, cleanedDdl)
-			}
+			// Копим в сводную статистику ([stats]).
+			stats.AddDdl(inserted, cleanedDdl)
+
+			log.Debugf("[ddl] cycle=%d time=%dms collect=%v inserted=%d cleanedDdl=%d",
+				cycleCount, time.Since(t0).Milliseconds(), doCollect, inserted, cleanedDdl)
 			return nil
 		})
 }
@@ -291,7 +299,7 @@ func runDdlLoop(ctx context.Context, conn *sql.DB, cfg *config.AppConfig,
 // ─────────────────────────────────────────────────────────────────────
 
 func runRsyslogLoop(ctx context.Context, conn *sql.DB, cfg *config.AppConfig,
-	log *logging.Logger, hb *daemon.Heartbeat) {
+	log *logging.Logger, hb *daemon.Heartbeat, stats *daemon.Stats) {
 
 	sender := logproc.NewRsyslogSender(conn,
 		cfg.Rsyslog.Host, cfg.Rsyslog.Port,
@@ -303,11 +311,12 @@ func runRsyslogLoop(ctx context.Context, conn *sql.DB, cfg *config.AppConfig,
 			cycleCount++
 			t0 := time.Now()
 			login, logoff, ddl := sender.Send()
-			elapsedMs := time.Since(t0).Milliseconds()
-			if log.IsDebug() || login > 0 || logoff > 0 || ddl > 0 {
-				log.Infof("[rsyslog] cycle=%d time=%dms login=%d logoff=%d ddl=%d",
-					cycleCount, elapsedMs, login, logoff, ddl)
-			}
+
+			// Копим в сводную статистику ([stats]).
+			stats.AddRsyslog(int64(login), int64(logoff), int64(ddl))
+
+			log.Debugf("[rsyslog] cycle=%d time=%dms login=%d logoff=%d ddl=%d",
+				cycleCount, time.Since(t0).Milliseconds(), login, logoff, ddl)
 			return nil
 		})
 }

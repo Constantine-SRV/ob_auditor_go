@@ -110,7 +110,7 @@ func (d *DdlDclAuditDao) Collect() (int64, error) {
 		return 0, fmt.Errorf("syncUnits: %w", err)
 	}
 	if unitsNew > 0 {
-		d.log.Infof("[DdlDclAuditDao] Added %d new unit(s) to checkpoint", unitsNew)
+		d.log.Debugf("[DdlDclAuditDao] Added %d new unit(s) to checkpoint", unitsNew)
 	}
 
 	// 2. Snapshot ghost-юнитов (в checkpoint, нет в DBA_OB_UNITS).
@@ -207,11 +207,11 @@ func (d *DdlDclAuditDao) Collect() (int64, error) {
 	}
 
 	durationMs := time.Since(startTime).Milliseconds()
-	if insertedTotal > 0 || unitsNew > 0 || unitsGhostPurged > 0 || d.log.IsDebug() {
-		d.log.Infof("[DdlDclAuditDao] Done: inserted=%d rows_scanned=%d units_total=%d units_new=%d units_with_data=%d units_ghost=%d duration_ms=%d",
-			insertedTotal, rowsScannedTotal, len(checkpoints),
-			unitsNew, unitsWithData, unitsGhostPurged, durationMs)
-	}
+	// Пер-прогонная статистика — только в DEBUG. В INFO агрегат уходит в
+	// сводную строку [stats] (см. пакет daemon).
+	d.log.Debugf("[DdlDclAuditDao] Done: inserted=%d rows_scanned=%d units_total=%d units_new=%d units_with_data=%d units_ghost=%d duration_ms=%d",
+		insertedTotal, rowsScannedTotal, len(checkpoints),
+		unitsNew, unitsWithData, unitsGhostPurged, durationMs)
 	return insertedTotal, nil
 }
 

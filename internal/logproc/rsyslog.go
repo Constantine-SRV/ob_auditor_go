@@ -141,8 +141,10 @@ func (s *RsyslogSender) Send() (int, int, int) {
 		return logins, logoffs, 0
 	}
 
+	// Пер-тиковая статистика отправки — только DEBUG. В INFO агрегат
+	// уходит в сводную строку [stats] (см. пакет daemon).
 	if logins+logoffs+ddl > 0 {
-		s.log.Infof("[RsyslogSender] Forwarded login=%d logoff=%d ddl=%d to %s:%d",
+		s.log.Debugf("[RsyslogSender] Forwarded login=%d logoff=%d ddl=%d to %s:%d",
 			logins, logoffs, ddl, s.host, s.port)
 	} else {
 		s.log.Debugf("[RsyslogSender] No new events to forward")

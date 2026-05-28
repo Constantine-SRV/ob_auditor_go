@@ -125,6 +125,9 @@ type DaemonConfig struct {
 	// Сколько ждать завершения работающих тиков при SIGTERM.
 	// После истечения — os.Exit(1).
 	ShutdownTimeout time.Duration `yaml:"shutdownTimeout"`
+
+	// Период печати сводной строки [stats]. 0 = выключить сводку.
+	StatsInterval time.Duration `yaml:"statsInterval"`
 }
 
 // AppConfig — корневая конфигурация приложения.
@@ -164,6 +167,7 @@ func defaultsConfig() *AppConfig {
 			WatchdogThreshold:     120 * time.Second,
 			WatchdogCheckInterval: 10 * time.Second,
 			ShutdownTimeout:       30 * time.Second,
+			StatsInterval:         60 * time.Second,
 		},
 		Rsyslog: RsyslogConfig{
 			Port:      514,
@@ -226,6 +230,10 @@ func Read(path string) (*AppConfig, error) {
 	}
 	if d.ShutdownTimeout <= 0 {
 		d.ShutdownTimeout = 30 * time.Second
+	}
+	// StatsInterval == 0 допустимо (выключает сводку), отрицательное → дефолт
+	if d.StatsInterval < 0 {
+		d.StatsInterval = 60 * time.Second
 	}
 
 	return cfg, nil

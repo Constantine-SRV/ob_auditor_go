@@ -43,6 +43,7 @@ daemon:
   watchdogThreshold:      120s  # тред считается зависшим если heartbeat старше
   watchdogCheckInterval:  10s   # как часто watchdog опрашивает heartbeat-ы
   shutdownTimeout:        30s   # сколько ждать тики на SIGTERM перед force exit
+  statsInterval:          60s   # период сводной строки [stats] (0 = выключить)
 
 cleanup:
   enabled:            true
