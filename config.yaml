@@ -1,26 +1,24 @@
 # =============================================================================
-# OceanBase Auditor - конфигурация (YAML)
+# OceanBase Auditor — конфигурация демона (YAML)
 # =============================================================================
 #
-# collectorId  — уникальный идентификатор экземпляра. Пусто → hostname.
-# logLevel     — DEBUG | INFO | ERROR
-# ignoredUsers — служебные УЗ, исключаемые из аудита логинов.
+# OBAuditor работает как долгоживущий процесс под управлением systemd.
+# Внутри запускаются три рабочие горутины (logs / ddl / rsyslog), каждая
+# с собственным интервалом. Watchdog следит за зависаниями и при их
+# обнаружении завершает процесс через os.Exit(1) — systemd с
+# Restart=on-failure поднимет его обратно.
+#
+# Семантика "Sleep после прогона": между концом одного тика и началом
+# следующего ВСЕГДА выдерживается соответствующий interval, независимо
+# от длительности самого тика. Если Collect занял 25 сек при
+# ddlDclInterval=20s — следующий стартанёт через 20 сек после конца.
 #
 # ddlDclAuditMode:
-#   0 — отключён
-#   1 — основной коллектор (собирает всегда)
-#   2 — резервный коллектор (собирает только если основной не обновлял
-#       audit_collector_state более 2 минут)
-#
-# cleanup.cleanupMinute   — минута часа (0–59) для удаления, -1 = выкл.
-# cleanup.maxDdlDclAuditRows — макс. строк (0 = без лимита)
-# cleanup.maxSessionsRows    — макс. строк (0 = без лимита)
-# cleanup.chunkSize          — размер чанка при удалении
-#
-# Под Windows пути расшаренных каталогов задаются UNC-нотацией:
-#   "\\\\192.168.55.205\\oceanbase_log"  (двойные обратные слэши в YAML)
-# или через короткую запись (стандартная YAML, одинарный слэш без экранирования):
-#   '\\192.168.55.205\oceanbase_log'      (в одинарных кавычках)
+#   0 — DDL/DCL коллектор выключен (горутина не запускается)
+#   1 — мастер: Collect выполняется каждый тик
+#   2 — резерв: Collect выполняется только если мастер молчит дольше
+#       daemon.ddlDclStaleThreshold (проверяется по
+#       MAX(updated_at) в ddl_dcl_audit_checkpoint)
 # =============================================================================
 
 collectorId: ""
@@ -35,29 +33,38 @@ ignoredUsers:
 
 ddlDclAuditMode: 1
 
-cleanup:
-  cleanupMinute: 0
-  maxDdlDclAuditRows: 500000
-  maxSessionsRows: 500000
-  chunkSize: 5000
+# Параметры долгоживущего сервиса
+daemon:
+  logsInterval:           60s   # таймер парсера лог-файлов
+  ddlDclInterval:         20s   # таймер DDL/DCL коллектора
+  rsyslogInterval:        10s   # таймер пересылки в rsyslog
+  ddlDclStaleThreshold:   60s   # резерв включается если мастер молчит дольше
+  cleanupEveryNCycles:    10    # COUNT + cleanup каждые N циклов (logs и ddl)
+  watchdogThreshold:      120s  # тред считается зависшим если heartbeat старше
+  watchdogCheckInterval:  10s   # как часто watchdog опрашивает heartbeat-ы
+  shutdownTimeout:        30s   # сколько ждать тики на SIGTERM перед force exit
 
+cleanup:
+  enabled:            true
+  maxDdlDclAuditRows: 500000
+  maxSessionsRows:    500000
+  chunkSize:          5000
+
+# Пути к каталогам логов OceanBase (Windows UNC или Linux mount-points)
 obProxyLogPaths:
   - '\\192.168.55.200\obproxy_log'
-  # - '\\192.168.55.201\obproxy_log'
 
 obServerLogPaths:
   - '\\192.168.55.205\oceanbase_log'
-  # - '\\192.168.55.206\oceanbase_log'
-  # - '\\192.168.55.207\oceanbase_log'
 
 systemTenantConnection:
   hosts:
     - "192.168.55.205:2881"
-    # - "192.168.55.206:2881"
   user: "ocp@sys"
   password: "qaz123"
   database: "oceanbase"
 
+# rsyslog: если host пустой — горутина не запускается
 rsyslog:
   host: "192.168.55.200"
   port: 514

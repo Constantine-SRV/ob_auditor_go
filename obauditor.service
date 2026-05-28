@@ -1,0 +1,55 @@
+[Unit]
+Description=OceanBase Auditor (long-running daemon)
+Documentation=https://github.com/Constantine-SRV/ob_auditor_go
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Юзер должен существовать и иметь доступ к каталогам логов OB
+# (SMB-mount или локальные пути). Конфиг должен быть им читаемым.
+User=obauditor
+Group=obauditor
+
+# Полный путь к бинарнику и конфигу. Меняй под свой layout.
+WorkingDirectory=/opt/obauditor
+ExecStart=/opt/obauditor/obauditor /opt/obauditor/config.yaml
+
+# Рестарт при любом ненулевом коде выхода (включая os.Exit(1) от watchdog).
+# Если бинарник завершился чисто (SIGTERM → код 0) — НЕ рестартим.
+Restart=on-failure
+RestartSec=10s
+
+# Защита от штормового перезапуска: если за 5 минут случилось 5
+# рестартов — systemd прекращает попытки и переводит unit в failed.
+# Поправь под свои аппетиты.
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Graceful shutdown: после SIGTERM ждём 45 сек (с запасом к
+# daemon.shutdownTimeout=30s), потом SIGKILL.
+TimeoutStopSec=45s
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Журналирование: stdout/stderr идут в journald.
+# Смотреть: journalctl -u obauditor -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=obauditor
+
+# Опционально: при наличии SMB-mount или сетевой шары стоит дождаться её.
+# Раскомментируй и подставь нужный mount.
+# RequiresMountsFor=/mnt/oceanbase_log
+
+# Безопасность (минимальный hardening — расширяй по вкусу).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Если пишем куда-то кроме рабочей директории — добавь сюда:
+ReadWritePaths=/opt/obauditor
+
+[Install]
+WantedBy=multi-user.target

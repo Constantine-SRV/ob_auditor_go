@@ -1,33 +1,63 @@
-// OceanBase Auditor — точка входа.
+// OBAuditor — долгоживущий демон.
 // Запуск: obauditor [config.yaml]
+//
+// Архитектура:
+//
+//   - main: читает конфиг, открывает БД, инициализирует таблицы, запускает
+//     три рабочие горутины и watchdog, ждёт SIGTERM/SIGINT.
+//
+//   - goroutine "logs"    — раз в logsInterval парсит логи OB,
+//     синхронизирует sessions, каждые N циклов чистит sessions.
+//
+//   - goroutine "ddl"     — раз в ddlDclInterval собирает DDL/DCL из
+//     GV$OB_SQL_AUDIT. В режиме 2 (резерв) запускает Collect только
+//     если мастер молчит дольше staleThreshold.
+//     Каждые N циклов чистит ddl_dcl_audit_log.
+//
+//   - goroutine "rsyslog" — раз в rsyslogInterval шлёт новые события в
+//     rsyslog по UDP. Запускается только если rsyslog.host задан.
+//
+//   - goroutine "watchdog" — раз в watchdogCheckInterval проверяет
+//     heartbeat-ы всех рабочих потоков. Если хоть один старше
+//     watchdogThreshold — os.Exit(1) → systemd Restart=on-failure.
+//
+// Sleep после прогона: между концом одного тика и началом следующего —
+// всегда interval, независимо от длительности самого тика. Если БД
+// тупит и Collect занял 25 сек при ddlDclInterval=20 сек — следующий
+// стартанёт через 20 сек ПОСЛЕ конца, то есть полный цикл 45 сек.
+// Это намеренно: фиксированная пауза предсказуема и предотвращает
+// штормовую нагрузку при медленной БД.
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 
 	"obauditor/internal/config"
+	"obauditor/internal/daemon"
 	"obauditor/internal/db"
 	"obauditor/internal/logging"
 	"obauditor/internal/logproc"
 )
 
 const defaultConfig = "config.yaml"
-const version = "go-20260527-1"
+const version = "go-20260528-daemon"
 
 func main() {
-	totalStart := time.Now()
-
 	configPath := defaultConfig
 	if len(os.Args) > 1 {
 		configPath = os.Args[1]
 	}
 
-	// 1. Читаем конфиг
+	// 1. Конфиг
 	cfg, err := config.Read(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[Main] Failed to read config: %v\n", err)
@@ -35,146 +65,249 @@ func main() {
 	}
 
 	log := logging.New(cfg.LogLevel)
+	log.Infof("=== OBAuditor %s starting ===", version)
+	log.Infof("Config: %s", configPath)
+	log.Infof("Collector: %s, LogLevel: %s, DdlDclMode: %d",
+		cfg.CollectorId, cfg.LogLevel, cfg.DdlDclAuditMode)
 
-	if log.IsInfo() {
-		log.Infof("=== OceanBase Auditor ===")
-		log.Infof("Config: %s", configPath)
+	if log.IsDebug() {
+		log.Debugf("Daemon: logs=%v ddl=%v rsyslog=%v stale=%v cleanupEveryN=%d watchdog=%v",
+			cfg.Daemon.LogsInterval, cfg.Daemon.DdlDclInterval,
+			cfg.Daemon.RsyslogInterval, cfg.Daemon.DdlDclStaleThreshold,
+			cfg.Daemon.CleanupEveryNCycles, cfg.Daemon.WatchdogThreshold)
 	}
 
-	// 2. Инициализируем список игнорируемых пользователей в парсерах
+	// 2. Игнорируемые пользователи в парсерах
 	logproc.SetServerIgnoredUsers(cfg.IgnoredUsers)
 	logproc.SetProxyIgnoredUsers(cfg.IgnoredUsers)
 
-	// 3. Печатаем конфиг (только DEBUG)
-	if log.IsDebug() {
-		log.Debugf("\n--- Loaded configuration ---")
-		log.Debugf("CollectorId        : %s", cfg.CollectorId)
-		log.Debugf("LogLevel           : %s", cfg.LogLevel)
-		log.Debugf("IgnoredUsers       : %v", cfg.IgnoredUsers)
-		log.Debugf("DdlDclAuditMode    : %d", cfg.DdlDclAuditMode)
-		log.Debugf("CleanupMinute      : %d", cfg.Cleanup.CleanupMinute)
-		log.Debugf("MaxDdlDclAuditRows : %d", cfg.Cleanup.MaxDdlDclAuditRows)
-		log.Debugf("MaxSessionsRows    : %d", cfg.Cleanup.MaxSessionsRows)
-		log.Debugf("CleanupChunkSize   : %d", cfg.Cleanup.ChunkSize)
-		log.Debugf("OBProxy log paths  : %v", cfg.ObProxyLogPaths)
-		log.Debugf("OBServer log paths : %v", cfg.ObServerLogPaths)
-		log.Debugf("RsyslogHost        : %s", cfg.Rsyslog.Host)
-		log.Debugf("RsyslogPort        : %d", cfg.Rsyslog.Port)
-		log.Debugf("RsyslogFacility    : %s", cfg.Rsyslog.Facility)
-		log.Debugf("RsyslogBatchSize   : %d", cfg.Rsyslog.BatchSize)
-		log.Debugf("DB connection      : %s", cfg.SystemTenantConnection.String())
-		log.Debugf("----------------------------\n")
-	}
-
-	// 4. Инициализация БД
-	initializer := db.NewInitializer(&cfg.SystemTenantConnection, log)
-	if err := initializer.Initialize(); err != nil {
+	// 3. Инициализация БД
+	if err := db.NewInitializer(&cfg.SystemTenantConnection, log).Initialize(); err != nil {
 		log.Errorf("[Main] DB initialization failed: %v", err)
 		os.Exit(1)
 	}
 
-	// 5. Основная обработка
+	// 4. Основное соединение
 	conn, err := sql.Open("mysql", cfg.SystemTenantConnection.DSN("admintools"))
 	if err != nil {
-		log.Errorf("[Main] DB connection failed: %v", err)
+		log.Errorf("[Main] DB open failed: %v", err)
 		os.Exit(1)
 	}
 	defer conn.Close()
-
-	// autoCommit в database/sql — это поведение по умолчанию для отдельных Exec.
-	// Это предотвращает многочасовые блокировки если процесс упадёт посередине прогона.
-	// Для атомарных операций (cleanup, обновление audit_collector_state)
-	// используем явные транзакции через conn.Begin().
-
 	if err := conn.Ping(); err != nil {
 		log.Errorf("[Main] DB ping failed: %v", err)
 		os.Exit(1)
 	}
 
-	// 5a. Обработка лог-файлов
-	processor := logproc.NewLogFileProcessor(conn, cfg, log)
-	if err := processor.ProcessServerDirs(cfg.ObServerLogPaths); err != nil {
-		log.Errorf("[Main] processServerDirs: %v", err)
-	}
-	if err := processor.ProcessProxyDirs(cfg.ObProxyLogPaths); err != nil {
-		log.Errorf("[Main] processProxyDirs: %v", err)
-	}
+	// 5. Signal handling + контекст для graceful shutdown
+	ctx, cancel := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
 
-	// 5b. Reconciliation PROXY-строк для неудачных логинов
-	sessionDao := db.NewSessionDao(conn)
-	if _, err := sessionDao.SyncFailedProxySessions(); err != nil {
-		log.Errorf("[Main] syncFailedProxySessions: %v", err)
-	}
+	// 6. Heartbeat-ы и watchdog
+	hbLogs := daemon.NewHeartbeat("logs")
+	hbDdl := daemon.NewHeartbeat("ddl")
+	hbRsyslog := daemon.NewHeartbeat("rsyslog")
 
-	// 5c. DDL/DCL аудит из GV$OB_SQL_AUDIT
-	var ddlDclInserted int64
-	if cfg.DdlDclAuditMode > 0 {
-		auditDao := db.NewDdlDclAuditDao(conn, log)
-		doCollect := false
-		switch cfg.DdlDclAuditMode {
-		case 1:
-			doCollect = true
-		case 2:
-			fallback, err := auditDao.ShouldCollectFallback()
-			if err != nil {
-				log.Errorf("[Main] shouldCollectFallback: %v", err)
-			}
-			doCollect = fallback
-		}
-		if doCollect {
-			n, err := auditDao.Collect()
-			if err != nil {
-				log.Errorf("[Main] ddl/dcl Collect: %v", err)
-			}
-			ddlDclInserted = n
-		}
-	}
-
-	// 5d. Очистка таблиц по расписанию
-	var cleanedDdlDcl, cleanedSessions int64
-	if cfg.Cleanup.CleanupMinute >= 0 {
-		currentMinute := time.Now().Minute()
-		if currentMinute == cfg.Cleanup.CleanupMinute {
-			log.Infof("[Main] Running scheduled cleanup (minute=%d)", currentMinute)
-			cleanupDao := db.NewCleanupDao(conn, log, cfg.Cleanup.ChunkSize)
-			if n, err := cleanupDao.CleanDdlDclAuditLog(cfg.Cleanup.MaxDdlDclAuditRows); err == nil {
-				cleanedDdlDcl = n
-			} else {
-				log.Errorf("[Main] cleanDdlDclAuditLog: %v", err)
-			}
-			if n, err := cleanupDao.CleanSessions(cfg.Cleanup.MaxSessionsRows); err == nil {
-				cleanedSessions = n
-			} else {
-				log.Errorf("[Main] cleanSessions: %v", err)
-			}
-		}
-	}
-
-	// 5e. Пересылка событий в rsyslog
-	var rsyslogLogin, rsyslogLogoff, rsyslogDdl int
+	wd := daemon.NewWatchdog(
+		cfg.Daemon.WatchdogThreshold,
+		cfg.Daemon.WatchdogCheckInterval,
+		log)
+	wd.Register(hbLogs)
+	wd.Register(hbDdl)
 	if cfg.Rsyslog.Host != "" {
-		sender := logproc.NewRsyslogSender(conn,
-			cfg.Rsyslog.Host, cfg.Rsyslog.Port,
-			cfg.Rsyslog.BatchSize, cfg.Rsyslog.Facility, log)
-		rsyslogLogin, rsyslogLogoff, rsyslogDdl = sender.Send()
+		wd.Register(hbRsyslog)
 	}
 
-	totalMs := time.Since(totalStart).Milliseconds()
-	fmt.Printf(
-		"[Main] Done. v%s Total time: %d ms"+
-			" | lines: %d | inserted: %d | logoff: %d | logoffMiss: %d"+
-			" | ddlDcl: %d | cleanedDdlDcl: %d | cleanedSessions: %d"+
-			" | rsyslogLogin: %d | rsyslogLogoff: %d | rsyslogDdl: %d\n",
-		version, totalMs,
-		processor.TotalLines(),
-		processor.TotalInserted(),
-		processor.TotalLogoff(),
-		processor.TotalLogoffMiss(),
-		ddlDclInserted,
-		cleanedDdlDcl,
-		cleanedSessions,
-		rsyslogLogin,
-		rsyslogLogoff,
-		rsyslogDdl,
-	)
+	// 7. Запускаем горутины
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runLogsLoop(ctx, conn, cfg, log, hbLogs)
+	}()
+
+	if cfg.DdlDclAuditMode > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runDdlLoop(ctx, conn, cfg, log, hbDdl)
+		}()
+	} else {
+		log.Infof("[Main] DdlDclAuditMode=0, ddl loop disabled")
+	}
+
+	if cfg.Rsyslog.Host != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runRsyslogLoop(ctx, conn, cfg, log, hbRsyslog)
+		}()
+	} else {
+		log.Infof("[Main] rsyslog.host empty, rsyslog loop disabled")
+	}
+
+	// Watchdog в отдельной горутине, она НЕ участвует в wg.Wait —
+	// она сама дёргает os.Exit при срабатывании и не должна задерживать shutdown.
+	go wd.Run(ctx)
+
+	log.Infof("[Main] All loops started, waiting for signal")
+
+	// 8. Ждём сигнал
+	<-ctx.Done()
+	log.Infof("[Main] Shutdown signal received, waiting for loops to finish (timeout=%v)",
+		cfg.Daemon.ShutdownTimeout)
+
+	if daemon.WaitWithTimeout(&wg, cfg.Daemon.ShutdownTimeout) {
+		log.Infof("[Main] Clean shutdown completed")
+	} else {
+		log.Errorf("[Main] Shutdown timeout exceeded — forcing exit")
+		os.Exit(1)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Logs loop — раз в logsInterval: парсинг файлов + sync + cleanup sessions
+// ─────────────────────────────────────────────────────────────────────
+
+func runLogsLoop(ctx context.Context, conn *sql.DB, cfg *config.AppConfig,
+	log *logging.Logger, hb *daemon.Heartbeat) {
+
+	sessionDao := db.NewSessionDao(conn)
+	cleanupDao := db.NewCleanupDao(conn, log, cfg.Cleanup.ChunkSize)
+	var cycleCount int64
+
+	daemon.RunLoop(ctx, "logs", cfg.Daemon.LogsInterval, hb, log,
+		func(ctx context.Context) error {
+			cycleCount++
+			t0 := time.Now()
+
+			processor := logproc.NewLogFileProcessor(conn, cfg, log)
+
+			if err := processor.ProcessServerDirs(cfg.ObServerLogPaths); err != nil {
+				log.Errorf("[logs] ProcessServerDirs: %v", err)
+			}
+			if err := processor.ProcessProxyDirs(cfg.ObProxyLogPaths); err != nil {
+				log.Errorf("[logs] ProcessProxyDirs: %v", err)
+			}
+			if _, err := sessionDao.SyncFailedProxySessions(); err != nil {
+				log.Errorf("[logs] SyncFailedProxySessions: %v", err)
+			}
+
+			// Cleanup каждые N циклов.
+			var cleanedSessions int64
+			if cfg.Cleanup.Enabled &&
+				cfg.Daemon.CleanupEveryNCycles > 0 &&
+				cycleCount%int64(cfg.Daemon.CleanupEveryNCycles) == 0 {
+				n, err := cleanupDao.CleanSessions(cfg.Cleanup.MaxSessionsRows)
+				if err != nil {
+					log.Errorf("[logs] CleanSessions: %v", err)
+				}
+				cleanedSessions = n
+			}
+
+			elapsedMs := time.Since(t0).Milliseconds()
+			lines := processor.TotalLines()
+			inserted := processor.TotalInserted()
+			logoff := processor.TotalLogoff()
+			logoffMiss := processor.TotalLogoffMiss()
+
+			// Лог только при ненулевой активности (или DEBUG).
+			if log.IsDebug() ||
+				inserted > 0 || logoff > 0 || logoffMiss > 0 || cleanedSessions > 0 {
+				log.Infof("[logs] cycle=%d time=%dms lines=%d inserted=%d logoff=%d logoffMiss=%d cleanedSessions=%d",
+					cycleCount, elapsedMs, lines, inserted, logoff, logoffMiss, cleanedSessions)
+			}
+			return nil
+		})
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// DDL loop — раз в ddlDclInterval: DDL/DCL collect + cleanup ddl_log
+// ─────────────────────────────────────────────────────────────────────
+
+func runDdlLoop(ctx context.Context, conn *sql.DB, cfg *config.AppConfig,
+	log *logging.Logger, hb *daemon.Heartbeat) {
+
+	auditDao := db.NewDdlDclAuditDao(conn, log)
+	cleanupDao := db.NewCleanupDao(conn, log, cfg.Cleanup.ChunkSize)
+	var cycleCount int64
+
+	daemon.RunLoop(ctx, "ddl", cfg.Daemon.DdlDclInterval, hb, log,
+		func(ctx context.Context) error {
+			cycleCount++
+			t0 := time.Now()
+
+			// Решаем, запускать ли Collect в этом тике.
+			//   mode=1 (мастер) — всегда
+			//   mode=2 (резерв) — только если мастер молчит дольше staleThreshold
+			doCollect := false
+			switch cfg.DdlDclAuditMode {
+			case 1:
+				doCollect = true
+			case 2:
+				stale, err := auditDao.ShouldCollectFallback()
+				if err != nil {
+					log.Errorf("[ddl] ShouldCollectFallback: %v", err)
+				}
+				doCollect = stale
+			}
+
+			var inserted int64
+			if doCollect {
+				n, err := auditDao.Collect()
+				if err != nil {
+					log.Errorf("[ddl] Collect: %v", err)
+				}
+				inserted = n
+			}
+
+			// Cleanup каждые N циклов (даже на резерве — проверка дешёвая,
+			// плюс на резерве у тебя обычно maxDdlDclAuditRows больше, и
+			// до cleanup-а просто никогда не доходит, что и нужно).
+			var cleanedDdl int64
+			if cfg.Cleanup.Enabled &&
+				cfg.Daemon.CleanupEveryNCycles > 0 &&
+				cycleCount%int64(cfg.Daemon.CleanupEveryNCycles) == 0 {
+				n, err := cleanupDao.CleanDdlDclAuditLog(cfg.Cleanup.MaxDdlDclAuditRows)
+				if err != nil {
+					log.Errorf("[ddl] CleanDdlDclAuditLog: %v", err)
+				}
+				cleanedDdl = n
+			}
+
+			elapsedMs := time.Since(t0).Milliseconds()
+			if log.IsDebug() || inserted > 0 || cleanedDdl > 0 {
+				log.Infof("[ddl] cycle=%d time=%dms collect=%v inserted=%d cleanedDdl=%d",
+					cycleCount, elapsedMs, doCollect, inserted, cleanedDdl)
+			}
+			return nil
+		})
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Rsyslog loop — раз в rsyslogInterval: пересылка событий в syslog
+// ─────────────────────────────────────────────────────────────────────
+
+func runRsyslogLoop(ctx context.Context, conn *sql.DB, cfg *config.AppConfig,
+	log *logging.Logger, hb *daemon.Heartbeat) {
+
+	sender := logproc.NewRsyslogSender(conn,
+		cfg.Rsyslog.Host, cfg.Rsyslog.Port,
+		cfg.Rsyslog.BatchSize, cfg.Rsyslog.Facility, log)
+	var cycleCount int64
+
+	daemon.RunLoop(ctx, "rsyslog", cfg.Daemon.RsyslogInterval, hb, log,
+		func(ctx context.Context) error {
+			cycleCount++
+			t0 := time.Now()
+			login, logoff, ddl := sender.Send()
+			elapsedMs := time.Since(t0).Milliseconds()
+			if log.IsDebug() || login > 0 || logoff > 0 || ddl > 0 {
+				log.Infof("[rsyslog] cycle=%d time=%dms login=%d logoff=%d ddl=%d",
+					cycleCount, elapsedMs, login, logoff, ddl)
+			}
+			return nil
+		})
 }
